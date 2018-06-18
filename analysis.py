@@ -24,9 +24,10 @@ def main(context):
 
     # Read the parquets
     comments = sqlContext.read.parquet("superbowl_comments.parquet")
-    comments.registerTempTable("commentsTable")
-
-    comments.show()
+    labels = comments.sample(False, 0.01, None)
+    labels.registerTempTable("labelsTable")
+    labels = sqlContext.sql("SELECT labelsTable.comments_id AS label_id, labelsTable.comments_body AS body, labelsTable.comments_author_flair_text AS flair FROM labelsTable WHERE labelsTable.comments_body NOT LIKE '%/s%' AND labelsTable.comments_body NOT LIKE '&gt%' AND labelsTable.comments_body NOT LIKE '%[deleted]%'")
+    labels.repartition(1).write.format("com.databricks.spark.csv").option("header", "true").save("labels.csv")
 
 if __name__ == "__main__":
     conf = SparkConf().setAppName("SuperBowl Sentiment Analysis")
