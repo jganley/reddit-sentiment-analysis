@@ -9,25 +9,46 @@ from pyspark.ml.tuning import CrossValidator, CrossValidatorModel, ParamGridBuil
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 import os
 
-def write_parquet(context):
+def write_parquet(sqlContext):
     # Read from JSON
     comments = sqlContext.read.json("superbowl_comments.json")
 
     # Write the Parquets
     comments.write.parquet("superbowl_comments.parquet")
 
-def main(context):
+def create_dataframe(sqlContext, comments, labels):
+
+    comments.registerTempTable("commentsTable")
+    labels.registerTempTable("labelsTable")
+
+    labeledData = sqlContext.sql("SELECT commentsTable.* FROM commentsTable INNER JOIN labelsTable ON commentsTable.comments_id = labelsTable.label_id")
+
+    def parse_text(text):
+        return cleantext.sanitize(text)
+
+    parse_udf = udf(parse_text, ArrayType(StringType()))
+    labeledData = labeledData.withColumn("udf_results", parse_udf(col("comments_body")))
+
+    return labeledData
+
+def main(sqlContext):
 
     # Check if the parquet file has already been written
     if not os.path.exists("superbowl_comments.parquet"):
-        write_parquet(context)
+        write_parquet(sqlContext)
 
     # Read the parquets
     comments = sqlContext.read.parquet("superbowl_comments.parquet")
-    labels = comments.sample(False, 0.01, None)
+    comments.registerTempTable("commentsTable")
+
+    # Read the labels csv
+    labels = sqlContext.read.format('csv').options(header='true', inferSchema='true').load("labels.csv")
     labels.registerTempTable("labelsTable")
-    labels = sqlContext.sql("SELECT labelsTable.comments_id AS label_id, labelsTable.comments_body AS body, labelsTable.comments_author_flair_text AS flair FROM labelsTable WHERE labelsTable.comments_body NOT LIKE '%/s%' AND labelsTable.comments_body NOT LIKE '&gt%' AND labelsTable.comments_body NOT LIKE '%[deleted]%'")
-    labels.repartition(1).write.format("com.databricks.spark.csv").option("header", "true").save("labels.csv")
+
+    # Create Dataframe to Train the Model
+    modelDataframe = create_dataframe(sqlContext, comments, labels)
+
+    modelDataframe.show()
 
 if __name__ == "__main__":
     conf = SparkConf().setAppName("SuperBowl Sentiment Analysis")
