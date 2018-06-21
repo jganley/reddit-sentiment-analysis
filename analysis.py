@@ -16,33 +16,25 @@ def write_parquet(sqlContext):
     # Write the Parquets
     comments.write.parquet("superbowl_comments.parquet")
 
-def create_dataframe(sqlContext, comments, labels):
-    comments.registerTempTable("commentsTable")
-    labels.registerTempTable("labelsTable")
-
-    labeledData = sqlContext.sql("SELECT commentsTable.* FROM commentsTable INNER JOIN labelsTable ON commentsTable.comments_id = labelsTable.label_id")
-
+def create_dataframe(sqlContext, modelDataframe):
     def parse_text(text):
         return cleantext.sanitize(text)
 
     parse_udf = udf(parse_text, ArrayType(StringType()))
-    labeledData = labeledData.withColumn("udf_results", parse_udf(col("comments_body")))
+    modelDataframe = modelDataframe.withColumn("udf_results", parse_udf(col("body")))
 
-    return labeledData
+    return modelDataframe
 
 def train_cv_model(modelDataframe):
     cv = CountVectorizer(inputCol="udf_results", outputCol="features", binary=True, minDF=5.0)
     model = cv.fit(modelDataframe)
     model.write().overwrite().save("models/cvModel")
 
-def transform_model(sqlContext, modelDataframe, labels):
-    labels.registerTempTable("labelsTable")
+def transform_model(sqlContext, modelDataframe):
     # Load the CV model
     model = CountVectorizerModel.load("models/cvModel")
     # Transform the data frame
     transformedDf = model.transform(modelDataframe)
-    transformedDf.registerTempTable("transformedDfTable")
-    transformedDf = sqlContext.sql("SELECT transformedDfTable.comments_id AS id, transformedDfTable.comments_body AS body, transformedDfTable.comments_author AS author, transformedDfTable.comments_created_utc AS created_utc, transformedDfTable.comments_subreddit_id AS subreddit_id, transformedDfTable.comments_link_id AS link_id, transformedDfTable.comments_parent_id AS parent_id, transformedDfTable.comments_score AS score, transformedDfTable.comments_controversiality AS controversiality, transformedDfTable.comments_gilded AS gilded, transformedDfTable.udf_results AS udf_results, transformedDfTable.features AS features, IF(labelsTable.label=1, 1, 0) AS pos_label, IF(labelsTable.label=-1, 1, 0) AS neg_label FROM transformedDfTable INNER JOIN labelsTable ON transformedDfTable.comments_id = labelsTable.label_id")
 
     return transformedDf
 
@@ -92,6 +84,17 @@ def create_models(sqlContext, modelDataframe):
     posModel.write().overwrite().save("models/posModel")
     negModel.write().overwrite().save("models/negModel")
 
+def create_fullDataframe(sqlContext, comments):
+    comments.registerTempTable("commentsTable")
+    # Create dataframe with all the data
+    fullDataframe = sqlContext.sql("SELECT commentsTable.comments_id AS id, commentsTable.comments_body AS body, commentsTable.comments_author AS author, commentsTable.comments_created_utc AS created_utc, commentsTable.comments_subreddit_id AS subreddit_id, commentsTable.comments_link_id AS link_id, commentsTable.comments_parent_id AS parent_id, commentsTable.comments_score AS score, commentsTable.comments_controversiality AS controversiality, commentsTable.comments_gilded AS gilded FROM commentsTable")
+    fullDataframe = create_dataframe(sqlContext, fullDataframe)
+
+    # Transform the full data
+    fullDataframe = transform_model(sqlContext, fullDataframe)
+
+    fullDataframe.write.parquet("fullDataframe.parquet")
+
 def main(sqlContext):
 
     # Check if the parquet file has already been written
@@ -107,14 +110,17 @@ def main(sqlContext):
     labels.registerTempTable("labelsTable")
 
     # Create Dataframe to Train the Model
-    modelDataframe = create_dataframe(sqlContext, comments, labels)
+    modelDataframe = sqlContext.sql("SELECT commentsTable.comments_id AS id, commentsTable.comments_body AS body, commentsTable.comments_author AS author, commentsTable.comments_created_utc AS created_utc, commentsTable.comments_subreddit_id AS subreddit_id, commentsTable.comments_link_id AS link_id, commentsTable.comments_parent_id AS parent_id, commentsTable.comments_score AS score, commentsTable.comments_controversiality AS controversiality, commentsTable.comments_gilded AS gilded FROM commentsTable INNER JOIN labelsTable ON commentsTable.comments_id = labelsTable.label_id")
+    modelDataframe = create_dataframe(sqlContext, modelDataframe)
 
     # Fit the CountVectorizer model
     if(not os.path.exists("models/cvModel")):
         train_cv_model(modelDataframe)
 
     # Use model to transform the data
-    modelDataframe = transform_model(sqlContext, modelDataframe, labels)
+    modelDataframe = transform_model(sqlContext, modelDataframe)
+    modelDataframe.registerTempTable("modelDataframeTable")
+    modelDataframe = sqlContext.sql("SELECT modelDataframeTable.*, IF(labelsTable.label=1, 1, 0) AS pos_label, IF(labelsTable.label=-1, 1, 0) AS neg_label FROM modelDataframeTable INNER JOIN labelsTable ON modelDataframeTable.id = labelsTable.label_id")
 
     if(not os.path.exists("models/negModel") or not os.path.exists("models/posModel")):
         create_models(sqlContext, modelDataframe)
@@ -122,6 +128,17 @@ def main(sqlContext):
     # Load the positive and negative models back in
     posModel = CrossValidatorModel.load("models/posModel")
     negModel = CrossValidatorModel.load("models/negModel")
+
+    if(not os.path.exists("fullDataframe.parquet")):
+        create_fullDataframe(sqlContext, comments)
+
+    # Load the full dataframe back in
+    fullDataframe = sqlContext.read.parquet("fullDataframe.parquet")
+    fullDataframe.registerTempTable("fullDataframeTable")
+
+    # Get rid of comments that are sarcastic or removed
+    fullDataframe = sqlContext.sql("SELECT * FROM fullDataframeTable WHERE fullDataframeTable.body NOT LIKE '%/s%' AND fullDataframeTable.body NOT LIKE '&gt%' AND fullDataframeTable.body NOT LIKE '%[removed]%'")
+
 
 
 
